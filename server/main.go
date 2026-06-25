@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,12 +29,14 @@ import (
 const grandRootID = "grand_root"
 
 type config struct {
-	addr        string
-	traqBaseURL string
-	clientID    string
-	redirectURL string
-	scope       string
-	appOrigin   string
+	addr               string
+	traqBaseURL        string
+	clientID           string
+	redirectURL        string
+	scope              string
+	appOrigin          string
+	viewerPollInterval time.Duration
+	viewerPollChannels int
 }
 
 type server struct {
@@ -102,6 +106,32 @@ type triggerPayload struct {
 	To   string `json:"to,omitempty"`
 }
 
+type viewerSnapshotPayload struct {
+	TS              int64                  `json:"ts"`
+	Total           int                    `json:"total"`
+	SampledChannels int                    `json:"sampledChannels"`
+	TotalChannels   int                    `json:"totalChannels"`
+	Channels        []viewerChannelSummary `json:"channels"`
+	Recent          []viewerRow            `json:"recent"`
+}
+
+type viewerChannelSummary struct {
+	ChannelID   string `json:"channelId"`
+	ChannelName string `json:"channelName"`
+	Count       int    `json:"count"`
+	Monitoring  int    `json:"monitoring"`
+	Editing     int    `json:"editing"`
+	Stale       int    `json:"stale"`
+}
+
+type viewerRow struct {
+	UserID      string    `json:"userId"`
+	ChannelID   string    `json:"channelId"`
+	ChannelName string    `json:"channelName"`
+	State       string    `json:"state"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
 type syncPayload struct {
 	TS     int64              `json:"ts"`
 	Deltas map[string]float64 `json:"deltas"`
@@ -122,13 +152,44 @@ type wsUserViewStateChangedBody struct {
 }
 
 type wsViewState struct {
-	Key       string `json:"key"`
-	ChannelID string `json:"channelId"`
-	State     string `json:"state"`
+	Key            string `json:"key"`
+	ChannelID      string `json:"channelId"`
+	ChannelIDSnake string `json:"channel_id"`
+	State          string `json:"state"`
+}
+
+func (s wsViewState) channelID() string {
+	if s.ChannelID != "" {
+		return s.ChannelID
+	}
+	return s.ChannelIDSnake
 }
 
 type traqMessage struct {
 	ChannelID string `json:"channelId"`
+}
+
+type channelData struct {
+	Channels []traqChannel
+	InitJSON []byte
+}
+
+type traqChannelViewer struct {
+	UserID    string    `json:"userId"`
+	State     string    `json:"state"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type viewerPoller struct {
+	mu            sync.Mutex
+	channels      []traqChannel
+	messageWeight map[string]float64
+	maxPerTick    int
+}
+
+type weightedChannel struct {
+	channel traqChannel
+	weight  float64
 }
 
 type tokenResponse struct {
@@ -144,12 +205,14 @@ func main() {
 	_ = godotenv.Load()
 
 	cfg := config{
-		addr:        getEnv("SERVER_ADDR", ":8080"),
-		traqBaseURL: strings.TrimRight(getEnv("TRAQ_BASE_URL", "https://q.trap.jp"), "/"),
-		clientID:    os.Getenv("TRAQ_CLIENT_ID"),
-		redirectURL: getEnv("TRAQ_REDIRECT_URL", "http://localhost:8080/api/auth/callback"),
-		scope:       getEnv("OAUTH_SCOPE", "read"),
-		appOrigin:   getEnv("APP_ORIGIN", "http://localhost:5173"),
+		addr:               getEnv("SERVER_ADDR", ":8080"),
+		traqBaseURL:        strings.TrimRight(getEnv("TRAQ_BASE_URL", "https://q.trap.jp"), "/"),
+		clientID:           os.Getenv("TRAQ_CLIENT_ID"),
+		redirectURL:        getEnv("TRAQ_REDIRECT_URL", "http://localhost:8080/api/auth/callback"),
+		scope:              getEnv("OAUTH_SCOPE", "read"),
+		appOrigin:          getEnv("APP_ORIGIN", "http://localhost:5173"),
+		viewerPollInterval: getEnvDuration("VIEWER_POLL_INTERVAL", 20*time.Second),
+		viewerPollChannels: getEnvInt("VIEWER_POLL_CHANNELS", 40),
 	}
 
 	sm := newStateManager()
@@ -333,28 +396,32 @@ func (sm *stateManager) randomChannelID() string {
 	return candidates[rand.Intn(len(candidates))]
 }
 
-func (s *server) fetchChannelInitPayload(ctx context.Context, accessToken string) ([]byte, error) {
+func (s *server) fetchChannelData(ctx context.Context, accessToken string) (channelData, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.traqBaseURL+"/api/v3/channels", nil)
 	if err != nil {
-		return nil, err
+		return channelData{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		return channelData{}, err
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("channels endpoint returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return channelData{}, fmt.Errorf("channels endpoint returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 
 	var channels traqChannelList
 	if err := json.Unmarshal(body, &channels); err != nil {
-		return nil, err
+		return channelData{}, err
 	}
-	return buildTraqInitPayload(channels.Public)
+	initJSON, err := buildTraqInitPayload(channels.Public)
+	if err != nil {
+		return channelData{}, err
+	}
+	return channelData{Channels: channels.Public, InitJSON: initJSON}, nil
 }
 
 func buildTraqInitPayload(channels []traqChannel) ([]byte, error) {
@@ -520,14 +587,16 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	initPayload := s.initPayload
+	var liveChannels []traqChannel
 	if !demo {
-		var err error
-		initPayload, err = s.fetchChannelInitPayload(ctx, token.AccessToken)
+		data, err := s.fetchChannelData(ctx, token.AccessToken)
 		if err != nil {
 			writeSSE(w, "stream-error", map[string]string{"error": "failed to load traQ channels: " + err.Error()})
 			flusher.Flush()
 			return
 		}
+		initPayload = data.InitJSON
+		liveChannels = data.Channels
 	}
 
 	writeRawSSE(w, "init", initPayload)
@@ -536,10 +605,14 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	var triggers <-chan triggerPayload
 	var errc <-chan error
+	var viewers <-chan viewerSnapshotPayload
+	var poller *viewerPoller
 	if demo {
 		triggers, errc = s.streamDemoTriggers(ctx)
 	} else {
+		poller = newViewerPoller(liveChannels, s.cfg.viewerPollChannels)
 		triggers, errc = s.streamTraqTriggers(ctx, token.AccessToken)
+		viewers = s.streamViewerSnapshots(ctx, token.AccessToken, poller)
 	}
 
 	syncTicker := time.NewTicker(8 * time.Second)
@@ -570,7 +643,17 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !changed {
 				continue
 			}
+			if trigger.Type == "msg" && poller != nil {
+				poller.noteMessage(trigger.Ch)
+			}
 			writeSSE(w, "trigger", trigger)
+			flusher.Flush()
+		case snapshot, ok := <-viewers:
+			if !ok {
+				viewers = nil
+				continue
+			}
+			writeSSE(w, "viewers", snapshot)
 			flusher.Flush()
 		case err, ok := <-errc:
 			if ok && err != nil {
@@ -686,6 +769,297 @@ func (s *server) streamTraqTriggers(ctx context.Context, accessToken string) (<-
 	return out, errc
 }
 
+func newViewerPoller(channels []traqChannel, maxPerTick int) *viewerPoller {
+	activeChannels := make([]traqChannel, 0, len(channels))
+	for _, ch := range channels {
+		if ch.ID != "" && !ch.Archived {
+			activeChannels = append(activeChannels, ch)
+		}
+	}
+	if maxPerTick <= 0 || maxPerTick > len(activeChannels) {
+		maxPerTick = len(activeChannels)
+	}
+	return &viewerPoller{
+		channels:      activeChannels,
+		messageWeight: map[string]float64{},
+		maxPerTick:    maxPerTick,
+	}
+}
+
+func (p *viewerPoller) noteMessage(channelID string) {
+	if p == nil || channelID == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.messageWeight[channelID] = math.Min(120, p.messageWeight[channelID]+12)
+}
+
+func (p *viewerPoller) sampleChannels() []traqChannel {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.channels) <= p.maxPerTick {
+		return append([]traqChannel(nil), p.channels...)
+	}
+
+	candidates := make([]weightedChannel, 0, len(p.channels))
+	for _, ch := range p.channels {
+		messageWeight := p.messageWeight[ch.ID]
+		candidates = append(candidates, weightedChannel{
+			channel: ch,
+			weight:  1 + messageWeight,
+		})
+		if messageWeight < 0.05 {
+			delete(p.messageWeight, ch.ID)
+		} else {
+			p.messageWeight[ch.ID] = messageWeight * 0.82
+		}
+	}
+
+	selected := make([]traqChannel, 0, p.maxPerTick)
+	for len(selected) < p.maxPerTick && len(candidates) > 0 {
+		totalWeight := 0.0
+		for _, candidate := range candidates {
+			totalWeight += candidate.weight
+		}
+		pick := rand.Float64() * totalWeight
+		selectedIndex := 0
+		for i, candidate := range candidates {
+			pick -= candidate.weight
+			if pick <= 0 {
+				selectedIndex = i
+				break
+			}
+		}
+		selected = append(selected, candidates[selectedIndex].channel)
+		candidates = append(candidates[:selectedIndex], candidates[selectedIndex+1:]...)
+	}
+
+	return selected
+}
+
+func (s *server) streamViewerSnapshots(ctx context.Context, accessToken string, poller *viewerPoller) <-chan viewerSnapshotPayload {
+	out := make(chan viewerSnapshotPayload)
+
+	go func() {
+		defer close(out)
+
+		ticker := time.NewTicker(s.cfg.viewerPollInterval)
+		defer ticker.Stop()
+
+		previous := map[string]viewerRow{}
+		for {
+			snapshot, current, sampledChannelIDs, err := s.fetchViewerSnapshot(ctx, accessToken, poller)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Printf("viewer snapshot skipped: %v", err)
+				}
+			} else {
+				logViewerChanges(filterViewerRows(previous, sampledChannelIDs), current)
+				mergeViewerRows(previous, current, sampledChannelIDs)
+				snapshot.Total = len(previous)
+				select {
+				case out <- snapshot:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+
+	return out
+}
+
+func (s *server) fetchViewerSnapshot(ctx context.Context, accessToken string, poller *viewerPoller) (viewerSnapshotPayload, map[string]viewerRow, map[string]bool, error) {
+	type result struct {
+		channel traqChannel
+		viewers []traqChannelViewer
+		err     error
+	}
+
+	activeChannels := poller.sampleChannels()
+	sampledChannelIDs := make(map[string]bool, len(activeChannels))
+	for _, ch := range activeChannels {
+		sampledChannelIDs[ch.ID] = true
+	}
+
+	sem := make(chan struct{}, 8)
+	results := make(chan result, len(activeChannels))
+	var wg sync.WaitGroup
+	for _, ch := range activeChannels {
+		ch := ch
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results <- result{channel: ch, err: ctx.Err()}
+				return
+			}
+			viewers, err := s.fetchChannelViewers(ctx, accessToken, ch.ID)
+			results <- result{channel: ch, viewers: viewers, err: err}
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	rows := make([]viewerRow, 0)
+	summaries := make([]viewerChannelSummary, 0)
+	current := map[string]viewerRow{}
+	var firstErr error
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		if len(res.viewers) == 0 {
+			continue
+		}
+
+		summary := viewerChannelSummary{
+			ChannelID:   res.channel.ID,
+			ChannelName: res.channel.Name,
+			Count:       len(res.viewers),
+		}
+		for _, viewer := range res.viewers {
+			switch viewer.State {
+			case "editing":
+				summary.Editing++
+			case "monitoring":
+				summary.Monitoring++
+			case "stale_viewing":
+				summary.Stale++
+			}
+			row := viewerRow{
+				UserID:      viewer.UserID,
+				ChannelID:   res.channel.ID,
+				ChannelName: res.channel.Name,
+				State:       viewer.State,
+				UpdatedAt:   viewer.UpdatedAt,
+			}
+			rows = append(rows, row)
+			current[viewerKey(row)] = row
+		}
+		summaries = append(summaries, summary)
+	}
+	if firstErr != nil && len(rows) == 0 {
+		return viewerSnapshotPayload{}, nil, nil, firstErr
+	}
+
+	sort.Slice(summaries, func(i, j int) bool {
+		if summaries[i].Count == summaries[j].Count {
+			return summaries[i].ChannelName < summaries[j].ChannelName
+		}
+		return summaries[i].Count > summaries[j].Count
+	})
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i].UpdatedAt.After(rows[j].UpdatedAt)
+	})
+	if len(summaries) > 12 {
+		summaries = summaries[:12]
+	}
+	if len(rows) > 24 {
+		rows = rows[:24]
+	}
+
+	return viewerSnapshotPayload{
+		TS:              time.Now().Unix(),
+		Total:           len(current),
+		SampledChannels: len(activeChannels),
+		TotalChannels:   len(poller.channels),
+		Channels:        summaries,
+		Recent:          rows,
+	}, current, sampledChannelIDs, nil
+}
+
+func (s *server) fetchChannelViewers(ctx context.Context, accessToken string, channelID string) ([]traqChannelViewer, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.traqBaseURL+"/api/v3/channels/"+url.PathEscape(channelID)+"/viewers", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("channel viewers endpoint returned %s for %s: %s", resp.Status, channelID, strings.TrimSpace(string(body)))
+	}
+
+	var viewers []traqChannelViewer
+	if err := json.Unmarshal(body, &viewers); err != nil {
+		return nil, err
+	}
+	return viewers, nil
+}
+
+func filterViewerRows(rows map[string]viewerRow, channelIDs map[string]bool) map[string]viewerRow {
+	filtered := make(map[string]viewerRow)
+	for key, row := range rows {
+		if channelIDs[row.ChannelID] {
+			filtered[key] = row
+		}
+	}
+	return filtered
+}
+
+func mergeViewerRows(rows map[string]viewerRow, current map[string]viewerRow, sampledChannelIDs map[string]bool) {
+	for key, row := range rows {
+		if sampledChannelIDs[row.ChannelID] {
+			delete(rows, key)
+		}
+	}
+	for key, row := range current {
+		rows[key] = row
+	}
+}
+
+func logViewerChanges(previous, current map[string]viewerRow) {
+	if previous == nil {
+		return
+	}
+	for key, row := range current {
+		prev, ok := previous[key]
+		if !ok {
+			log.Printf("viewer entered: user=%s channel=%s state=%s", row.UserID, row.ChannelName, row.State)
+			continue
+		}
+		if prev.State != row.State {
+			log.Printf("viewer state changed: user=%s channel=%s %s->%s", row.UserID, row.ChannelName, prev.State, row.State)
+		}
+	}
+	for key, row := range previous {
+		if _, ok := current[key]; !ok {
+			log.Printf("viewer left: user=%s channel=%s state=%s", row.UserID, row.ChannelName, row.State)
+		}
+	}
+}
+
+func viewerKey(row viewerRow) string {
+	return row.UserID + "|" + row.ChannelID
+}
+
 func (s *server) parseTraqTriggers(ctx context.Context, accessToken string, payload []byte) ([]triggerPayload, error) {
 	var event wsEvent
 	if err := json.Unmarshal(payload, &event); err != nil {
@@ -719,13 +1093,14 @@ func (s *server) parseTraqTriggers(ctx context.Context, accessToken string, payl
 		log.Printf("%v", body)
 		triggers := make([]triggerPayload, 0, len(body.ViewStates))
 		for _, viewState := range body.ViewStates {
-			if viewState.Key == "" || viewState.ChannelID == "" || viewState.State == "none" {
+			channelID := viewState.channelID()
+			if viewState.Key == "" || channelID == "" || viewState.State == "none" {
 				continue
 			}
 			triggers = append(triggers, triggerPayload{
 				Type: "mov",
 				Usr:  hashSessionKey(viewState.Key),
-				To:   viewState.ChannelID,
+				To:   channelID,
 			})
 		}
 		return triggers, nil
@@ -842,8 +1217,8 @@ func (s *server) sessionToken(r *http.Request) (tokenResponse, bool) {
 func (s *server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == s.cfg.appOrigin {
-			w.Header().Set("Access-Control-Allow-Origin", s.cfg.appOrigin)
+		if s.isAllowedOrigin(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
@@ -856,6 +1231,37 @@ func (s *server) withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *server) isAllowedOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	if origin == s.cfg.appOrigin {
+		return true
+	}
+
+	configured, err := url.Parse(s.cfg.appOrigin)
+	if err != nil {
+		return false
+	}
+	requested, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if configured.Scheme != requested.Scheme || configured.Port() != requested.Port() {
+		return false
+	}
+	return isLoopbackHost(configured.Hostname()) && isLoopbackHost(requested.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
+	}
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -891,4 +1297,30 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		log.Printf("invalid %s=%q; using %s", key, value, fallback)
+		return fallback
+	}
+	return duration
+}
+
+func getEnvInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Printf("invalid %s=%q; using %d", key, value, fallback)
+		return fallback
+	}
+	return parsed
 }

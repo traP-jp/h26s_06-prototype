@@ -148,7 +148,7 @@ h2 {
 .metrics {
   display: grid;
   gap: 8px;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   margin: 18px 0;
 }
 
@@ -166,7 +166,7 @@ dt {
 }
 
 dd {
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 760;
   line-height: 1.1;
   margin: 5px 0 0;
@@ -241,6 +241,61 @@ li {
   white-space: nowrap;
 }
 
+.panel h2 small {
+  color: #8090ac;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.viewerChannel {
+  display: grid;
+  gap: 4px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.viewerChannel span {
+  grid-column: 1;
+}
+
+.viewerChannel strong {
+  color: #8cf1d8;
+  font-size: 14px;
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.viewerChannel small {
+  color: #92a3bf;
+  font-size: 11px;
+  grid-column: 1 / -1;
+}
+
+.viewerList li {
+  display: grid;
+  gap: 3px 8px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.viewerList time {
+  grid-column: 1;
+}
+
+.viewerList span {
+  grid-column: 2;
+}
+
+.viewerList em {
+  color: #ffd166;
+  font-size: 12px;
+  font-style: normal;
+  grid-column: 3;
+}
+
+.emptyText {
+  color: #8090ac;
+  font-size: 12px;
+}
+
 meter {
   appearance: none;
   background: rgba(255, 255, 255, 0.07);
@@ -287,5 +342,9 @@ time {
 
   h1 {
     font-size: 24px;
+  }
+
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

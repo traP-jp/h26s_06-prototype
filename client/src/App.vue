@@ -16,11 +16,19 @@ const beamCount = ref(0)
 const activeChannels = ref([])
 const hoveredChannel = ref(null)
 const events = ref([])
+const viewerTotal = ref(0)
+const viewerChannels = ref([])
+const viewerRecent = ref([])
+const viewerUpdatedAt = ref('')
+const sampledChannels = ref(0)
+const totalChannels = ref(0)
 
 let source = null
 let topologyScene = null
 
 const latestEvents = computed(() => events.value.slice(0, 8))
+const visibleViewerChannels = computed(() => viewerChannels.value.slice(0, 8))
+const visibleViewerRecent = computed(() => viewerRecent.value.slice(0, 8))
 
 async function refreshAuth() {
   try {
@@ -79,6 +87,24 @@ function connect(mode) {
     topologyScene?.sync(payload.deltas)
   })
 
+  source.addEventListener('viewers', (event) => {
+    const payload = JSON.parse(event.data)
+    viewerTotal.value = payload.total ?? 0
+    viewerChannels.value = payload.channels ?? []
+    viewerRecent.value = payload.recent ?? []
+    sampledChannels.value = payload.sampledChannels ?? 0
+    totalChannels.value = payload.totalChannels ?? 0
+    viewerUpdatedAt.value = new Date((payload.ts ?? Date.now() / 1000) * 1000).toLocaleTimeString()
+    console.table(
+      viewerRecent.value.map((row) => ({
+        user: shortUser(row.userId),
+        channel: row.channelName,
+        state: stateLabel(row.state),
+        updatedAt: formatTime(row.updatedAt),
+      })),
+    )
+  })
+
   source.addEventListener('stream-error', (event) => {
     connected.value = false
     status.value = event.data ? JSON.parse(event.data).error : 'SSE エラー'
@@ -96,6 +122,33 @@ function disconnect() {
     source = null
   }
   connected.value = false
+}
+
+function stateLabel(state) {
+  switch (state) {
+    case 'editing':
+      return '入力中'
+    case 'monitoring':
+      return '閲覧中'
+    case 'stale_viewing':
+      return '過去ログ'
+    case 'none':
+      return '非表示'
+    default:
+      return state || '-'
+  }
+}
+
+function shortUser(userId) {
+  if (!userId) return '-'
+  return userId.length > 12 ? `${userId.slice(0, 8)}...` : userId
+}
+
+function formatTime(value) {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return '-'
+  return date.toLocaleTimeString()
 }
 
 function rememberEvent(payload) {
@@ -196,6 +249,10 @@ onBeforeUnmount(() => {
           <dt>Beams</dt>
           <dd>{{ beamCount }}</dd>
         </div>
+        <div>
+          <dt>Viewers</dt>
+          <dd>{{ viewerTotal }}</dd>
+        </div>
       </dl>
 
       <section v-if="hoveredChannel" class="focusPanel">
@@ -214,6 +271,35 @@ onBeforeUnmount(() => {
             <meter min="0" max="100" :value="node.score" />
           </li>
         </ol>
+      </section>
+
+      <section class="panel">
+        <h2>
+          閲覧中チャンネル
+          <small v-if="viewerUpdatedAt">({{ viewerUpdatedAt }} / sample {{ sampledChannels }} of {{ totalChannels }})</small>
+        </h2>
+        <ol v-if="visibleViewerChannels.length">
+          <li v-for="channel in visibleViewerChannels" :key="channel.channelId" class="viewerChannel">
+            <span>{{ channel.channelName }}</span>
+            <strong>{{ channel.count }}</strong>
+            <small>
+              閲覧 {{ channel.monitoring }} / 入力 {{ channel.editing }} / 過去 {{ channel.stale }}
+            </small>
+          </li>
+        </ol>
+        <p v-else class="emptyText">live 接続後に表示します</p>
+      </section>
+
+      <section class="panel">
+        <h2>最近の閲覧</h2>
+        <ul v-if="visibleViewerRecent.length" class="viewerList">
+          <li v-for="row in visibleViewerRecent" :key="`${row.userId}-${row.channelId}-${row.updatedAt}`">
+            <time>{{ formatTime(row.updatedAt) }}</time>
+            <span>{{ shortUser(row.userId) }} / {{ row.channelName }}</span>
+            <em>{{ stateLabel(row.state) }}</em>
+          </li>
+        </ul>
+        <p v-else class="emptyText">viewer snapshot を待機中</p>
       </section>
 
       <section class="panel">
