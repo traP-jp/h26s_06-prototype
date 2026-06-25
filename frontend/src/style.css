@@ -1,0 +1,141 @@
+:root {
+  color: #18202a;
+  background: #f5f7fb;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button {
+  border: 1px solid #b9c2d0;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #172033;
+  cursor: pointer;
+  font: inherit;
+  min-height: 36px;
+  padding: 0 14px;
+}
+
+button:disabled {
+  color: #8892a3;
+  cursor: not-allowed;
+}
+
+.shell {
+  margin: 0 auto;
+  max-width: 1120px;
+  padding: 32px 20px;
+}
+
+.toolbar {
+  align-items: flex-start;
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+
+h1 {
+  font-size: 28px;
+  letter-spacing: 0;
+  line-height: 1.2;
+  margin: 0 0 8px;
+}
+
+p {
+  color: #596579;
+  margin: 0;
+}
+
+.actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.badge {
+  align-items: center;
+  border: 1px solid #cfd6e2;
+  border-radius: 999px;
+  color: #596579;
+  display: inline-flex;
+  min-height: 32px;
+  padding: 0 12px;
+  white-space: nowrap;
+}
+
+.badge.on {
+  border-color: #167a57;
+  color: #167a57;
+}
+
+.stream {
+  background: #ffffff;
+  border: 1px solid #d7dee9;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.streamHeader {
+  align-items: center;
+  border-bottom: 1px solid #e1e6ef;
+  display: flex;
+  justify-content: space-between;
+  min-height: 52px;
+  padding: 0 16px;
+}
+
+.empty {
+  color: #68758a;
+  padding: 28px 16px;
+}
+
+.eventItem {
+  border-top: 1px solid #edf0f5;
+  padding: 14px 16px 16px;
+}
+
+.eventItem:first-of-type {
+  border-top: 0;
+}
+
+time {
+  color: #667388;
+  display: block;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+pre {
+  background: #101722;
+  border-radius: 6px;
+  color: #e9eef7;
+  line-height: 1.45;
+  margin: 0;
+  overflow: auto;
+  padding: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+@media (max-width: 720px) {
+  .toolbar {
+    display: block;
+  }
+
+  .actions {
+    justify-content: flex-start;
+    margin-top: 16px;
+  }
+}
