@@ -24,13 +24,14 @@ traQ OpenAPI `docs/v3-api.yaml` で以下を確認した。
 リアルタイム WS と polling を併用する。
 
 1. Live 接続開始時に `GET /api/v3/channels` で公開チャンネル一覧を取得する。
-2. 既存通り `GET /api/v3/ws` に接続し、`MESSAGE_CREATED` と `USER_VIEWSTATE_CHANGED` を activity trigger として扱う。
-3. 全員分の閲覧状況は、公開チャンネルの一部に対して `GET /api/v3/channels/{channelId}/viewers` を定期実行する。
+2. 自身または祖先がアーカイブ済みのチャンネルは、初期表示、viewer polling、activity trigger の対象から除外する。
+3. 既存通り `GET /api/v3/ws` に接続し、`MESSAGE_CREATED` と `USER_VIEWSTATE_CHANGED` を activity trigger として扱う。
+4. 全員分の閲覧状況は、公開チャンネルの一部に対して `GET /api/v3/channels/{channelId}/viewers` を定期実行する。
    - 各 tick で最大 `VIEWER_POLL_CHANNELS` 件だけ選ぶ。
    - `MESSAGE_CREATED` が来たチャンネルの重みを上げ、メッセージが多いチャンネルほど選ばれやすくする。
    - 重みは tick ごとに減衰するので、最近活発なチャンネルが優先される。
-4. backend は viewer snapshot を `viewers` SSE イベントとして frontend に送る。
-5. backend は前回 snapshot と比較し、entered / left / state changed をログ出力する。
+5. backend は viewer snapshot を `viewers` SSE イベントとして frontend に送る。
+6. backend は前回 snapshot と比較し、entered / left / state changed をログ出力する。
 
 `USER_VIEWSTATE_CHANGED` は全員分を保証しないため、全体表示の正は channel viewers polling 側に置いている。ただし API リクエスト数を抑えるため、現在は全件ではなく重み付きサンプリングで取得する。
 
@@ -39,7 +40,7 @@ traQ OpenAPI `docs/v3-api.yaml` で以下を確認した。
 主な実装ファイル: `server/main.go`
 
 - `fetchChannelData`
-  - `GET /api/v3/channels` を取得し、3D 表示用 init payload と polling 用チャンネル一覧を作る。
+  - `GET /api/v3/channels` を取得し、自身または祖先がアーカイブ済みのチャンネルを除外してから 3D 表示用 init payload と polling 用チャンネル一覧を作る。
 - `streamTraqTriggers`
   - `GET /api/v3/ws` に接続し、既存の activity trigger を流す。
 - `streamViewerSnapshots`

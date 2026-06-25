@@ -170,8 +170,9 @@ type traqMessage struct {
 }
 
 type channelData struct {
-	Channels []traqChannel
-	InitJSON []byte
+	Channels   []traqChannel
+	ChannelIDs map[string]bool
+	InitJSON   []byte
 }
 
 type traqChannelViewer struct {
@@ -259,7 +260,7 @@ func newStateManager() *stateManager {
 		},
 	}
 
-	rootNames := []string{"general", "random", "event", "team", "times", "project", "creative", "tech", "archive"}
+	rootNames := []string{"general", "random", "event", "team", "times", "project", "creative", "tech"}
 	for i, name := range rootNames {
 		rootID := fmt.Sprintf("island-%d", i+1)
 		channels[grandRootID].Children = append(channels[grandRootID].Children, rootID)
@@ -417,11 +418,73 @@ func (s *server) fetchChannelData(ctx context.Context, accessToken string) (chan
 	if err := json.Unmarshal(body, &channels); err != nil {
 		return channelData{}, err
 	}
-	initJSON, err := buildTraqInitPayload(channels.Public)
+	activeChannels := filterActiveTraqChannels(channels.Public)
+	initJSON, err := buildTraqInitPayload(activeChannels)
 	if err != nil {
 		return channelData{}, err
 	}
-	return channelData{Channels: channels.Public, InitJSON: initJSON}, nil
+	return channelData{
+		Channels:   activeChannels,
+		ChannelIDs: buildTraqChannelIDSet(activeChannels),
+		InitJSON:   initJSON,
+	}, nil
+}
+
+func filterActiveTraqChannels(channels []traqChannel) []traqChannel {
+	byID := make(map[string]traqChannel, len(channels))
+	for _, ch := range channels {
+		if ch.ID != "" {
+			byID[ch.ID] = ch
+		}
+	}
+
+	includeCache := make(map[string]bool, len(channels))
+	activeChannels := make([]traqChannel, 0, len(channels))
+	for _, ch := range channels {
+		if isTraqChannelActiveWithAncestors(ch.ID, byID, includeCache, map[string]bool{}) {
+			activeChannels = append(activeChannels, ch)
+		}
+	}
+	return activeChannels
+}
+
+func isTraqChannelActiveWithAncestors(channelID string, channels map[string]traqChannel, cache map[string]bool, visiting map[string]bool) bool {
+	if channelID == "" {
+		return false
+	}
+	if active, ok := cache[channelID]; ok {
+		return active
+	}
+	if visiting[channelID] {
+		cache[channelID] = false
+		return false
+	}
+
+	ch, ok := channels[channelID]
+	if !ok || ch.ID == "" || ch.Archived {
+		cache[channelID] = false
+		return false
+	}
+	if ch.ParentID == nil || *ch.ParentID == "" {
+		cache[channelID] = true
+		return true
+	}
+
+	visiting[channelID] = true
+	active := isTraqChannelActiveWithAncestors(*ch.ParentID, channels, cache, visiting)
+	delete(visiting, channelID)
+	cache[channelID] = active
+	return active
+}
+
+func buildTraqChannelIDSet(channels []traqChannel) map[string]bool {
+	channelIDs := make(map[string]bool, len(channels))
+	for _, ch := range channels {
+		if ch.ID != "" && !ch.Archived {
+			channelIDs[ch.ID] = true
+		}
+	}
+	return channelIDs
 }
 
 func buildTraqInitPayload(channels []traqChannel) ([]byte, error) {
@@ -588,6 +651,7 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	initPayload := s.initPayload
 	var liveChannels []traqChannel
+	var liveChannelIDs map[string]bool
 	if !demo {
 		data, err := s.fetchChannelData(ctx, token.AccessToken)
 		if err != nil {
@@ -597,6 +661,7 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		initPayload = data.InitJSON
 		liveChannels = data.Channels
+		liveChannelIDs = data.ChannelIDs
 	}
 
 	writeRawSSE(w, "init", initPayload)
@@ -638,6 +703,9 @@ func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				triggers = nil
 				continue
 			}
+			if !demo && !isTriggerForActiveChannel(trigger, liveChannelIDs) {
+				continue
+			}
 			var changed bool
 			trigger, changed = s.state.applyTrigger(trigger)
 			if !changed {
@@ -670,6 +738,20 @@ func streamStatus(demo bool) string {
 		return "demo connected"
 	}
 	return "traQ connected"
+}
+
+func isTriggerForActiveChannel(trigger triggerPayload, channelIDs map[string]bool) bool {
+	if len(channelIDs) == 0 {
+		return false
+	}
+	switch trigger.Type {
+	case "msg":
+		return channelIDs[trigger.Ch]
+	case "mov":
+		return channelIDs[trigger.To]
+	default:
+		return false
+	}
 }
 
 func (s *server) streamDemoTriggers(ctx context.Context) (<-chan triggerPayload, <-chan error) {
