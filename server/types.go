@@ -8,39 +8,67 @@ import (
 )
 
 // このファイルは、サーバ全体で共有する設定・状態・traQ API 用 DTO をまとめます。
+// grandRootID は traQ 由来ではない仮想ルートで、フロントの木構造を 1 つにまとめます。
 const grandRootID = "grand_root"
 
+// config は環境変数から読み込んだアプリ全体の設定です。
 type config struct {
-	addr               string
-	traqBaseURL        string
-	clientID           string
-	redirectURL        string
-	scope              string
-	appOrigin          string
+	// addr は Go HTTP server の listen アドレスです。
+	addr string
+	// traqBaseURL は traQ API のベース URL です。
+	traqBaseURL string
+	// clientID は OAuth 認可リクエストに使う traQ client ID です。
+	clientID string
+	// redirectURL は traQ OAuth から戻る callback URL です。
+	redirectURL string
+	// scope は OAuth で要求する権限です。
+	scope string
+	// appOrigin は CORS と OAuth 後の戻り先に使うフロント URL です。
+	appOrigin string
+	// viewerPollInterval は viewers API を poll する間隔です。
 	viewerPollInterval time.Duration
+	// viewerPollChannels は 1 回の poll でサンプリングするチャンネル数です。
 	viewerPollChannels int
 }
 
+// server は HTTP handler 群が共有する依存関係とメモリ状態を持ちます。
 type server struct {
-	cfg         config
-	client      *http.Client
-	mu          sync.Mutex
-	states      map[string]time.Time
-	sessions    map[string]tokenResponse
-	state       *stateManager
+	// cfg は起動時に読み込んだ設定です。
+	cfg config
+	// client は traQ API / OAuth endpoint を呼ぶ HTTP client です。
+	client *http.Client
+	// mu は OAuth state と session map を守る mutex です。
+	mu sync.Mutex
+	// states は OAuth state とその期限を保持します。
+	states map[string]time.Time
+	// sessions は session ID から token response を引くメモリストアです。
+	sessions map[string]tokenResponse
+	// state はチャンネル熱量とユーザー現在地を管理します。
+	state *stateManager
+	// initPayload は demo mode の SSE init で送る JSON です。
 	initPayload []byte
 }
 
+// channel はサーバ内で扱うチャンネルノードと熱量状態です。
 type channel struct {
-	ID            string
-	Name          string
-	ParentID      string
-	Children      []string
-	IslandID      int
-	Depth         int
-	Score         float64
+	// ID は traQ channel ID または demo 用 ID です。
+	ID string
+	// Name は UI に表示するチャンネル名です。
+	Name string
+	// ParentID は親チャンネル ID です。
+	ParentID string
+	// Children は子チャンネル ID の配列です。
+	Children []string
+	// IslandID はフロントの色分け/島配置に使います。
+	IslandID int
+	// Depth は root からの深さで、サイズや距離に使います。
+	Depth int
+	// Score は現在のサーバ側熱量です。
+	Score float64
+	// LastSyncScore は最後にフロントへ送った熱量です。
 	LastSyncScore float64
-	LastSyncTime  time.Time
+	// LastSyncTime は最後に減衰/同期した時刻です。
+	LastSyncTime time.Time
 }
 
 type userState struct {

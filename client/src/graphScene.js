@@ -6,9 +6,13 @@ import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 
+// ループ内で一時オブジェクトを使い回し、毎フレームの GC を減らします。
 const scratchObject = new THREE.Object3D();
+// 色計算用の一時 Color です。
 const scratchColor = new THREE.Color();
+// ベクトル計算用の一時 Vector3 です。
 const scratchVector = new THREE.Vector3();
+// もう一つ同時に必要なときの一時 Vector3 です。
 const scratchVectorB = new THREE.Vector3();
 
 // createTraqScene は Vue から呼ばれる Three.js シーンの入口です。
@@ -18,53 +22,78 @@ export function createTraqScene(container, callbacks = {}) {
 
 class TraqTopologyScene {
     constructor(container, callbacks) {
+        // Vue 側から渡された DOM 要素に canvas を追加します。
         this.container = container;
+        // onStats/onHover/onContextLost など、Vue へ状態を返す callback 群です。
         this.callbacks = callbacks;
+        // ChannelGraph は init イベントを受け取るまで null です。
         this.graph = null;
+        // チャンネルノードを描く InstancedMesh です。
         this.mesh = null;
+        // 親子リンクを描く InstancedMesh です。
         this.links = null;
+        // linkPairs は [parentNode, childNode] の配列で、links の instance と対応します。
         this.linkPairs = [];
+        // requestAnimationFrame の ID を保持し、dispose 時に止めます。
         this.frameId = 0;
+        // 前フレーム時刻から delta 秒を出すための基準です。
         this.lastFrame = performance.now();
+        // onStats を間引くため、最後に通知した時刻を持ちます。
         this.lastStatsAt = 0;
+        // raycast を間引くため、最後に実行した時刻を持ちます。
         this.lastRaycastAt = 0;
+        // 現在 hover 中のノードです。
         this.hoveredNode = null;
+        // タブ非表示時は一部エフェクトを止めるため visibility state を保持します。
         this.hidden = document.visibilityState === "hidden";
+        // メッセージ発生後、祖先へ順番に波紋を出す予約キューです。
         this.scheduledRipples = [];
+        // dispose が必要な geometry/material をまとめて保持します。
         this.disposables = [];
 
+        // Three.js の描画シーンを作り、背景色と fog を設定します。
         this.scene = new THREE.Scene();
         this.scene.background = new THREE.Color("#030712");
         this.scene.fog = new THREE.FogExp2("#030712", 0.008);
 
+        // 3D 空間を見るカメラを作り、初期位置を少し斜め上に置きます。
         this.camera = new THREE.PerspectiveCamera(52, 1, 0.1, 1200);
         this.camera.position.set(46, 38, 92);
 
+        // WebGL renderer を作り、パフォーマンス優先で antialias を有効にします。
         this.renderer = new THREE.WebGLRenderer({
             antialias: true,
             powerPreference: "high-performance",
         });
+        // 高 DPI 端末でも重くなりすぎないよう pixel ratio を 1.5 までに制限します。
         this.renderer.setPixelRatio(
             Math.min(window.devicePixelRatio || 1, 1.5),
         );
+        // 色空間と tone mapping を設定し、発光色が自然に見えるようにします。
         this.renderer.outputColorSpace = THREE.SRGBColorSpace;
         this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
         this.renderer.toneMappingExposure = 1.08;
+        // CSS で全画面表示するための class を付けます。
         this.renderer.domElement.className = "threeCanvas";
+        // Vue の stage 要素へ canvas を差し込みます。
         container.appendChild(this.renderer.domElement);
 
+        // OrbitControls により、ユーザーがドラッグ/ズームで全体を眺められます。
         this.controls = new OrbitControls(
             this.camera,
             this.renderer.domElement,
         );
+        // damping を入れて、操作後に少し慣性が残る見た目にします。
         this.controls.enableDamping = true;
         this.controls.dampingFactor = 0.065;
+        // 操作速度とズーム範囲を、巨大なチャンネル木でも扱いやすい値にします。
         this.controls.rotateSpeed = 0.45;
         this.controls.zoomSpeed = 0.72;
         this.controls.panSpeed = 0.35;
         this.controls.minDistance = 18;
         this.controls.maxDistance = 520;
 
+        // postprocessing composer を使い、Bloom を重ねて発光表現にします。
         this.composer = new EffectComposer(this.renderer);
         this.renderPass = new RenderPass(this.scene, this.camera);
         this.bloomPass = new UnrealBloomPass(
@@ -76,9 +105,11 @@ class TraqTopologyScene {
         this.composer.addPass(this.renderPass);
         this.composer.addPass(this.bloomPass);
 
+        // pointer hover 判定用の raycaster と正規化 pointer 座標です。
         this.raycaster = new THREE.Raycaster();
         this.pointer = new THREE.Vector2();
 
+        // 星背景、エフェクト pool、イベント listener、初期サイズ、animation loop を順番に準備します。
         this.createBackdrop();
         this.createEffectPools();
         this.bindEvents();
@@ -87,9 +118,13 @@ class TraqTopologyScene {
     }
 
     bindEvents() {
+        // リサイズ時は canvas と camera aspect を更新します。
         this.handleResize = () => this.resize();
+        // pointermove は raycast して hover 中ノードを探します。
         this.handlePointerMove = (event) => this.raycast(event);
+        // canvas 外へ出たら hover を解除します。
         this.handlePointerLeave = () => this.setHoveredNode(null);
+        // タブ表示状態が変わったら hidden を更新し、復帰時は古い一時エフェクトを消します。
         this.handleVisibility = () => {
             this.hidden = document.visibilityState === "hidden";
             this.lastFrame = performance.now();
@@ -97,11 +132,13 @@ class TraqTopologyScene {
                 this.clearTransientEffects();
             }
         };
+        // WebGL context lost はブラウザ都合で起きるため、Vue 側へ通知します。
         this.handleContextLost = (event) => {
             event.preventDefault();
             this.callbacks.onContextLost?.();
         };
 
+        // window/document/canvas に必要なイベント listener を登録します。
         window.addEventListener("resize", this.handleResize);
         document.addEventListener("visibilitychange", this.handleVisibility);
         this.renderer.domElement.addEventListener(
@@ -120,33 +157,41 @@ class TraqTopologyScene {
     }
 
     createBackdrop() {
+        // 背景の星を Points でまとめて描き、奥行き感を作ります。
         const starCount = 1100;
+        // position/color は BufferAttribute として GPU へ渡します。
         const positions = new Float32Array(starCount * 3);
         const colors = new Float32Array(starCount * 3);
         const starColor = new THREE.Color();
         for (let index = 0; index < starCount; index += 1) {
+            // 半径を広めに取り、チャンネル木の周囲を包む球殻に星を置きます。
             const radius = 110 + Math.random() * 360;
             const theta = Math.random() * Math.PI * 2;
             const phi = Math.acos(THREE.MathUtils.randFloatSpread(2));
+            // 球面座標を xyz に変換して position 配列へ入れます。
             positions[index * 3] = radius * Math.sin(phi) * Math.cos(theta);
             positions[index * 3 + 1] = radius * Math.cos(phi);
             positions[index * 3 + 2] = radius * Math.sin(phi) * Math.sin(theta);
+            // 青寄りの HSL で少しずつ明るさを変えます。
             starColor.setHSL(
                 0.58 + Math.random() * 0.12,
                 0.38,
                 0.42 + Math.random() * 0.34,
             );
+            // Color の r/g/b を attribute 用配列へ入れます。
             colors[index * 3] = starColor.r;
             colors[index * 3 + 1] = starColor.g;
             colors[index * 3 + 2] = starColor.b;
         }
 
+        // geometry に position/color attribute を設定します。
         const geometry = new THREE.BufferGeometry();
         geometry.setAttribute(
             "position",
             new THREE.BufferAttribute(positions, 3),
         );
         geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        // AdditiveBlending と透明度で、暗い背景に淡く光る星にします。
         const material = new THREE.PointsMaterial({
             size: 0.62,
             vertexColors: true,
@@ -155,12 +200,15 @@ class TraqTopologyScene {
             depthWrite: false,
             blending: THREE.AdditiveBlending,
         });
+        // Points として scene に追加します。
         const stars = new THREE.Points(geometry, material);
         this.scene.add(stars);
+        // dispose 時に geometry/material を解放できるよう登録します。
         this.disposables.push(geometry, material);
     }
 
     createEffectPools() {
+        // 波紋は頻繁に出るため、都度 new せず pool から再利用します。
         this.ripplePool = Array.from({ length: 72 }, () => {
             const geometry = new THREE.TorusGeometry(1, 0.018, 6, 64);
             const material = new THREE.MeshBasicMaterial({
@@ -171,13 +219,16 @@ class TraqTopologyScene {
                 blending: THREE.AdditiveBlending,
             });
             const mesh = new THREE.Mesh(geometry, material);
+            // 未使用状態では描画しないよう hidden にします。
             mesh.visible = false;
+            // userData.effect に bornAt/ttl/node などを入れて、updateEffects で進行します。
             mesh.userData.effect = null;
             this.scene.add(mesh);
             this.disposables.push(geometry, material);
             return mesh;
         });
 
+        // メッセージ発生時に root から target へ飛ぶ粒子の pool です。
         this.particlePool = Array.from({ length: 48 }, () => {
             const geometry = new THREE.SphereGeometry(0.58, 12, 8);
             const material = new THREE.MeshBasicMaterial({
@@ -195,6 +246,7 @@ class TraqTopologyScene {
             return mesh;
         });
 
+        // ユーザー移動時に from から to へ伸びるビームの pool です。
         this.beamPool = Array.from({ length: 72 }, () => {
             const geometry = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);
             const material = new THREE.MeshBasicMaterial({
@@ -214,23 +266,31 @@ class TraqTopologyScene {
     }
 
     setChannels(channels) {
+        // init SSE で届いたチャンネルツリーから、配置済みの ChannelGraph を作ります。
         this.graph = new ChannelGraph(channels);
+        // graph のノード数に合わせて node/link の InstancedMesh を作り直します。
         this.rebuildNodes();
         this.rebuildLinks();
 
+        // graph.extent に応じてカメラ距離を決め、全体が画面に収まりやすくします。
         const distance = THREE.MathUtils.clamp(
             this.graph.extent * 1.35,
             78,
             360,
         );
+        // 少し斜め上から見る位置にカメラを置きます。
         this.camera.position.set(distance * 0.45, distance * 0.36, distance);
+        // OrbitControls の注視点を原点へ戻します。
         this.controls.target.set(0, 0, 0);
         this.controls.update();
+        // 初回表示のカクつきを抑えるため、シーンを先に compile します。
         this.renderer.compile(this.scene, this.camera);
+        // init 直後はすぐ HUD の node 数などを更新します。
         this.emitStats(true);
     }
 
     rebuildNodes() {
+        // 既存 mesh がある場合は scene から外して GPU リソースを解放します。
         if (this.mesh) {
             this.scene.remove(this.mesh);
             this.mesh.geometry.dispose();
@@ -238,7 +298,9 @@ class TraqTopologyScene {
             this.mesh = null;
         }
 
+        // 各チャンネルノードは同じ sphere geometry を instance として大量描画します。
         const geometry = new THREE.SphereGeometry(1, 18, 12);
+        // ShaderMaterial を使い、instanceColor と rim light で発光感を出します。
         const material = new THREE.ShaderMaterial({
             vertexShader: `
         varying vec3 vColor;
